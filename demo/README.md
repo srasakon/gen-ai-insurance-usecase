@@ -1,5 +1,5 @@
 ## Demo: Hyper Intelligent Test Runner
 
-[![Hyper Intelligent Test Runner demo](videos/Hyper%20Intelligent%20Test%20Runner.png)](videos/Hyper%20Intelligent%20Test%20Runner.mp4)
 
-▶ Click the image to watch the demo.
+https://github.com/user-attachments/assets/c530d70b-a5f6-41ab-955d-7f6b27ceb6e3
+
