@@ -49,104 +49,275 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 log = logging.getLogger("chunker")  # never log document content at INFO or above
 
-PROMPT_VERSION = "2026-11-26.1"
+PROMPT_VERSION = "2026-11-26.2"
 
 
 # =========================================================================== #
 # Inputs (hardcoded variables)
 # =========================================================================== #
 SYSTEM_PROMPT = """\
-You are a document-structure analyst for insurance financial documents (audited financial
-statements, statutory filings, interim reports, loss runs, Schedule P exhibits, MD&A).
+You are a document-structure analyst for insurance financial documents: audited financial
+statements, statutory filings, interim reports, loss runs, Schedule P exhibits and MD&A.
 
-The document is below, between the <document> tags. Every line starts with its line number,
-for example `L0007 `. The line number is not part of the document. A line like
+<document>
+{{DOCUMENT}}
+</document>
+
+<context>
+The document above is Markdown. Each line starts with its line number, for example `L0007 `.
+The line number is a label for you; it is not part of the document. A line such as
 `<!-- page 3 -->` is a page marker.
 
-Your task: split the document into chunks and describe each chunk with structured metadata.
-Give line ranges and metadata only. Do not give chunk text. Do not copy numbers.
+Your output splits the document into chunks. Each chunk will later be read on its own,
+without the rest of the document. The metadata you give is therefore the only way a reader
+of one chunk knows the scale, currency, reinsurance basis and periods of its numbers. A wrong
+value leads to confident, wrong numbers later. A value of "unknown" or null is safe: it tells
+the reader to look elsewhere. So when the document does not state a fact, report it as
+unknown or null.
 
-BOUNDARY RULES
-1. Cover every line exactly once. Give the chunks in document order. Chunk 1 starts at line 1.
-   Each chunk starts at the previous end_line + 1. The last chunk ends at the last line.
-   Page markers and blank lines also belong to a chunk.
-2. Do not cut inside a table. The user message lists the table spans. A boundary can be before
-   the first line of a span or after its last line. It cannot be between them. A table that
-   continues after a page marker is one span.
-3. Start a chunk at a header, or at a page marker or blank line just before a header. Do not
-   start a chunk in the middle of a section. Keep a header with the content below it.
-4. Keep a chunk to about MAX_CHUNK_LINES lines or fewer. Go over only for one table that you
-   cannot split. Prefer one chunk for each statement, schedule or note.
-5. If there is content before the first header (entity name, policy number, carrier,
-   valuation date, "amounts in thousands" note), put that content in its own chunk with
-   section "preamble".
-6. If a parent header is directly followed by a child header, keep the parent header in the
-   chunk of the first child, and include it in header_path.
+Code cuts the chunk text out of the original document using your line ranges, so you give
+line ranges and metadata only. Code also checks your output: full line coverage, no cut
+inside a table, and that each evidence line really shows the fact. Code computes page
+numbers, the latest period and the full-year flag itself.
+</context>
 
-METADATA RULES
-7. header_path: the headers above and at the chunk start, outermost first, joined by " > ".
-   Include parent headers that have no content of their own. Write the header text without
-   `#` marks. For the preamble chunk, write "Preamble".
-8. Use only the allowed enum values. If you are not sure, use "unknown" or null. A missing
-   value is much better than a wrong value.
-9. document: facts for the whole document. Set default_scale only if the document states it
-   (for example "in thousands of Canadian dollars"), and give that line in
-   default_scale_evidence_line. default_currency is an ISO 4217 code (USD, CAD, EUR, GBP).
-10. For each chunk:
-    - scale and currency: what applies to the numbers in this chunk.
-      scale_source = "explicit_in_chunk" if the chunk states it,
-      "inherited_from_doc" if an earlier note for the whole document states it,
-      "inferred" only if strong evidence shows it, otherwise "unknown".
-    - reinsurance_basis: "gross", "ceded", "assumed" or "net" if all figures in the chunk
-      are on one basis. "mixed" if the chunk shows more than one (for example Gross / Ceded /
-      Net columns). "not_applicable" for text without amounts (auditor report, preamble,
-      accounting policies). Otherwise "unknown".
-    - periods: one entry for each period COLUMN in the chunk's tables, or the period that a
-      text chunk describes. Copy column_label exactly. Give facts only:
-      period_end (YYYY-MM-DD), period_months (12, 9, 6, 3; null for a balance-sheet date),
-      period_type, audited (true, false or null), restated.
+<boundary_rules>
+1. Cover every line exactly once, in document order: chunk 1 starts at L1, each chunk starts
+   at the previous end_line + 1, and the last chunk ends at the last line. Page markers and
+   blank lines belong to the chunk around them. Code rebuilds the document from your ranges,
+   so a gap or an overlap loses or duplicates text.
+2. Keep each table span (listed in the task message) inside one chunk. A table cut in two
+   separates data rows from the column header that explains them. A table that continues
+   after a page marker is one span.
+3. Start each chunk at a header, or at the page marker or blank line just before a header.
+   A chunk that starts mid-section loses the header that identifies it.
+4. Aim for about MAX_CHUNK_LINES lines per chunk, and prefer one chunk per statement,
+   schedule or note. A single table that is longer than the limit stays whole.
+5. Put content that comes before the first header (entity name, policy number, carrier,
+   valuation date, a "amounts in thousands" note) in its own chunk with section "preamble".
+   This content often sets the context for the whole document.
+6. When a parent header is directly followed by a child header, keep the parent header in
+   the chunk of its first child and name it in header_path, so its context stays attached.
+</boundary_rules>
+
+<metadata_rules>
+7. header_path: the headers above and at the chunk start, outermost first, joined by " > ",
+   written without `#` marks. Include parent headers that have no content of their own.
+   For the preamble chunk, write "Preamble".
+8. Use only the allowed enum values.
+9. document: facts stated for the whole document. Set default_scale and default_currency
+   only from a note that applies to the whole document (for example a note under the title
+   or in the preamble), and give its line in default_scale_evidence_line. Use ISO 4217
+   currency codes (USD, CAD, EUR, GBP). fiscal_year_end is "MM-DD" when the document states
+   the year-end date.
+10. Per chunk, describe the numbers in that chunk:
+    - scale and currency. scale_source is "explicit_in_chunk" when the chunk states it,
+      "inherited_from_doc" when a whole-document note states it, "inferred" only for strong
+      evidence such as a column header "$000", and "unknown" otherwise.
+    - reinsurance_basis: "gross", "ceded", "assumed" or "net" when all figures share one
+      basis; "mixed" when the chunk shows several (for example Gross / Ceded / Net columns);
+      "not_applicable" for text without amounts (auditor report, preamble, policies);
+      "unknown" when the basis is not stated.
+    - periods: one entry per period column in the chunk's tables, or the period that a text
+      chunk describes. Columns that are not periods (Gross, Ceded, Net, Line) are not periods.
+      column_label is copied exactly and is unique within the chunk. Give facts only:
+      period_end (YYYY-MM-DD, or null when the date is not stated or implied by a stated
+      year end), period_months (12, 9, 6, 3; null for a point-in-time date), period_type,
+      audited (true, false, or null when not stated) and restated.
       period_type: "annual" (12-month fiscal year), "interim_ytd" (for example nine months
-      ended), "quarter", "ttm", "budget", "projection", "pro_forma", "as_of_date" (a
-      balance-sheet or valuation date), "unknown".
-      Do not say which period is the latest or a full year. Code calculates that.
-      Each column_label must be unique in a chunk.
-    - evidence: a list of {field, line} for each of section, scale, currency and
-      reinsurance_basis that is not unknown, null or not_applicable. The line must show the
-      fact as text (for example the line with "in thousands", "Net" or "CAD").
-      For each period, give in evidence_line the line that shows its column label or date.
+      ended), "quarter", "ttm", "budget", "projection", "pro_forma", "as_of_date" (balance
+      sheet or valuation date), "unknown". Code decides which period is latest or full year,
+      so describe each period only by its own facts.
+</metadata_rules>
 
-WORKED EXAMPLE
-Input:
+<evidence_rules>
+11. For each of section, scale, currency and reinsurance_basis that has a value other than
+    unknown, null or not_applicable, add {field, line} to evidence. The line must show the
+    fact in words: the line with "in thousands", "Net", "CAD" or the section header.
+    Code reads that line; when it does not show the fact, code resets the field to unknown.
+12. For each period, give in evidence_line the line that shows its column label or date.
+</evidence_rules>
+
+<scratchpad>
+Fill the scratchpad first, before document and chunks. It is your working space: the
+document and chunks that follow must agree with it. Keep each entry short.
+- evidence_quotes: quote the lines that set context, each as "Lnnnn <short quote> -> <what it
+  sets>". Look for scale and currency notes, year-end and period headings, audit status,
+  basis (GAAP, IFRS, statutory), Gross / Ceded / Net labels, budget or projection columns,
+  and page markers inside tables. Quoting first keeps the later metadata tied to the text.
+- outline: the planned chunks in order, each as "Lstart-Lend <header_path> (<section>)".
+- plan_check: check the outline against the checklist below and write the result of each
+  check in a few words. If a check fails, fix the outline here, then write the corrected
+  chunks.
+</scratchpad>
+
+<verification_checklist>
+- Coverage: the first range starts at L1, the last ends at the last line, and each range
+  starts one line after the previous one ends.
+- Tables: each table span from the task message lies inside one planned range.
+- Preamble: content before the first header has its own chunk.
+- Headers: each chunk starts at a header or at the marker or blank line just before one.
+- Evidence: each non-unknown scale, currency and basis has a quoted line that shows it.
+- Periods: only period columns are listed, labels are unique, and each date is stated in or
+  implied by the document.
+</verification_checklist>
+
+<examples>
+<example>
+<input>
 L0001 ACME INSURANCE LTD.
 L0002 Amounts in thousands of Canadian dollars
 L0003
 L0004 <!-- page 1 -->
 L0005 # Financial Statements
 L0006 ## Statement of Income
-L0007 | Item | 2025 | 2024 |
-L0008 |---|---|---|
-L0009 | Net premiums earned | 1,200 | 1,100 |
-Output:
-{"document": {"entity_name": "ACME INSURANCE LTD.", "document_type": "financial statements",
+L0007 For the year ended December 31, 2025
+L0008
+L0009 | Item | 2025 | 2024 |
+L0010 |---|---|---|
+L0011 | Net premiums earned | 1,200 | 1,100 |
+Table spans: L9-L11
+</input>
+<output>
+{"scratchpad": {
+  "evidence_quotes": [
+    "L0002 Amounts in thousands of Canadian dollars -> document scale thousands, currency CAD",
+    "L0007 For the year ended December 31, 2025 -> annual, year end 12-31",
+    "L0011 Net premiums earned -> net basis"],
+  "outline": [
+    "L1-L3 Preamble (preamble)",
+    "L4-L11 Financial Statements > Statement of Income (income_statement)"],
+  "plan_check": "Coverage L1-L3, L4-L11: complete. Table L9-L11 inside L4-L11. Preamble kept. Scale and currency quoted at L2, basis at L11. Periods 2025 and 2024 unique; year end stated at L7."},
+ "document": {"entity_name": "ACME INSURANCE LTD.", "document_type": "financial statements",
   "basis": "unknown", "default_currency": "CAD", "default_scale": "thousands",
-  "default_scale_evidence_line": 2, "fiscal_year_end": null},
+  "default_scale_evidence_line": 2, "fiscal_year_end": "12-31"},
  "chunks": [
   {"start_line": 1, "end_line": 3, "header_path": "Preamble", "section": "preamble",
    "reinsurance_basis": "not_applicable", "currency": "CAD", "scale": "thousands",
    "scale_source": "explicit_in_chunk", "periods": [],
    "evidence": [{"field": "scale", "line": 2}, {"field": "currency", "line": 2}]},
-  {"start_line": 4, "end_line": 9,
+  {"start_line": 4, "end_line": 11,
    "header_path": "Financial Statements > Statement of Income", "section": "income_statement",
    "reinsurance_basis": "net", "currency": "CAD", "scale": "thousands",
    "scale_source": "inherited_from_doc",
    "periods": [
-     {"column_label": "2025", "period_end": null, "period_months": 12, "period_type": "annual",
-      "audited": null, "restated": false, "evidence_line": 7},
-     {"column_label": "2024", "period_end": null, "period_months": 12, "period_type": "annual",
-      "audited": null, "restated": false, "evidence_line": 7}],
-   "evidence": [{"field": "section", "line": 6}, {"field": "reinsurance_basis", "line": 9},
+     {"column_label": "2025", "period_end": "2025-12-31", "period_months": 12,
+      "period_type": "annual", "audited": null, "restated": false, "evidence_line": 9},
+     {"column_label": "2024", "period_end": "2024-12-31", "period_months": 12,
+      "period_type": "annual", "audited": null, "restated": false, "evidence_line": 9}],
+   "evidence": [{"field": "section", "line": 6}, {"field": "reinsurance_basis", "line": 11},
                 {"field": "scale", "line": 2}, {"field": "currency", "line": 2}]}]}
-(period_end is null because the example does not state the fiscal year-end date.)
+</output>
+</example>
+
+<example>
+<input>
+L0001 # Interim Condensed Financial Statements
+L0002 (unaudited, in millions of US dollars)
+L0003
+L0004 ## Statement of Income
+L0005
+L0006 | Item | 9M Sep-25 | 9M Sep-24 |
+L0007 |---|---|---|
+L0008 | Gross premiums written | 410 | 388 |
+L0009 <!-- page 2 -->
+L0010 | Gross losses incurred | 251 | 240 |
+L0011
+L0012 ## Balance Sheet
+L0013
+L0014 | Item | Sep 30, 2025 | Dec 31, 2024 |
+L0015 |---|---|---|
+L0016 | Total assets | 2,904 | 2,811 |
+Table spans: L6-L10, L14-L16
+</input>
+<output>
+{"scratchpad": {
+  "evidence_quotes": [
+    "L0002 (unaudited, in millions of US dollars) -> under the title, so document scale millions, currency USD; unaudited",
+    "L0006 9M Sep-25 | 9M Sep-24 -> nine months ended Sep 30, interim",
+    "L0008 Gross premiums written -> gross basis",
+    "L0009 page marker inside table L6-L10 -> one table",
+    "L0014 Sep 30, 2025 | Dec 31, 2024 -> balance sheet dates"],
+  "outline": [
+    "L1-L11 Interim Condensed Financial Statements > Statement of Income (income_statement)",
+    "L12-L16 Interim Condensed Financial Statements > Balance Sheet (balance_sheet)"],
+  "plan_check": "Coverage L1-L11, L12-L16: complete. Table L6-L10 inside L1-L11 across the page marker; L14-L16 inside L12-L16. No preamble: L1 is a header. Parent header L1 kept with first child. Scale and currency quoted at L2. Entity name not stated. Balance sheet basis not stated."},
+ "document": {"entity_name": null, "document_type": "interim condensed financial statements",
+  "basis": "unknown", "default_currency": "USD", "default_scale": "millions",
+  "default_scale_evidence_line": 2, "fiscal_year_end": null},
+ "chunks": [
+  {"start_line": 1, "end_line": 11,
+   "header_path": "Interim Condensed Financial Statements > Statement of Income",
+   "section": "income_statement", "reinsurance_basis": "gross", "currency": "USD",
+   "scale": "millions", "scale_source": "explicit_in_chunk",
+   "periods": [
+     {"column_label": "9M Sep-25", "period_end": "2025-09-30", "period_months": 9,
+      "period_type": "interim_ytd", "audited": false, "restated": false, "evidence_line": 6},
+     {"column_label": "9M Sep-24", "period_end": "2024-09-30", "period_months": 9,
+      "period_type": "interim_ytd", "audited": false, "restated": false, "evidence_line": 6}],
+   "evidence": [{"field": "section", "line": 4}, {"field": "scale", "line": 2},
+                {"field": "currency", "line": 2}, {"field": "reinsurance_basis", "line": 8}]},
+  {"start_line": 12, "end_line": 16,
+   "header_path": "Interim Condensed Financial Statements > Balance Sheet",
+   "section": "balance_sheet", "reinsurance_basis": "unknown", "currency": "USD",
+   "scale": "millions", "scale_source": "inherited_from_doc",
+   "periods": [
+     {"column_label": "Sep 30, 2025", "period_end": "2025-09-30", "period_months": null,
+      "period_type": "as_of_date", "audited": false, "restated": false, "evidence_line": 14},
+     {"column_label": "Dec 31, 2024", "period_end": "2024-12-31", "period_months": null,
+      "period_type": "as_of_date", "audited": null, "restated": false, "evidence_line": 14}],
+   "evidence": [{"field": "section", "line": 12}, {"field": "scale", "line": 2},
+                {"field": "currency", "line": 2}]}]}
+</output>
+</example>
+
+<example>
+<input>
+L0001 # Note 7 - Reinsurance
+L0002 The Company cedes property risks under a quota share treaty.
+L0003
+L0004 | Line | Gross | Ceded | Net |
+L0005 |---|---|---|---|
+L0006 | Property | 900 | 300 | 600 |
+L0007
+L0008 # Plan 2026
+L0009
+L0010 | Item | 2025 Actual | 2026 Budget |
+L0011 |---|---|---|
+L0012 | Net premiums earned | 600 | 650 |
+Table spans: L4-L6, L10-L12
+</input>
+<output>
+{"scratchpad": {
+  "evidence_quotes": [
+    "L0004 Gross | Ceded | Net -> mixed basis; these columns are not periods",
+    "L0010 2025 Actual | 2026 Budget -> one actual year, one budget year; no dates stated",
+    "L0012 Net premiums earned -> net basis",
+    "No scale or currency note anywhere -> unknown and null"],
+  "outline": [
+    "L1-L7 Note 7 - Reinsurance (notes)",
+    "L8-L12 Plan 2026 (other)"],
+  "plan_check": "Coverage L1-L7, L8-L12: complete. Tables L4-L6 and L10-L12 each inside one range. No preamble: L1 is a header. No scale or currency stated, so unknown and null. Note 7 has no period columns. Year-end dates not stated, so period_end is null."},
+ "document": {"entity_name": null, "document_type": null, "basis": "unknown",
+  "default_currency": null, "default_scale": "unknown", "default_scale_evidence_line": null,
+  "fiscal_year_end": null},
+ "chunks": [
+  {"start_line": 1, "end_line": 7, "header_path": "Note 7 - Reinsurance", "section": "notes",
+   "reinsurance_basis": "mixed", "currency": null, "scale": "unknown",
+   "scale_source": "unknown", "periods": [],
+   "evidence": [{"field": "section", "line": 1}, {"field": "reinsurance_basis", "line": 4}]},
+  {"start_line": 8, "end_line": 12, "header_path": "Plan 2026", "section": "other",
+   "reinsurance_basis": "net", "currency": null, "scale": "unknown",
+   "scale_source": "unknown",
+   "periods": [
+     {"column_label": "2025 Actual", "period_end": null, "period_months": 12,
+      "period_type": "annual", "audited": null, "restated": false, "evidence_line": 10},
+     {"column_label": "2026 Budget", "period_end": null, "period_months": 12,
+      "period_type": "budget", "audited": null, "restated": false, "evidence_line": 10}],
+   "evidence": [{"field": "reinsurance_basis", "line": 12}]}]}
+</output>
+</example>
+</examples>
 """
 
 FINANCIAL_DOCUMENT_NAME = "northwind_mutual_fy2025"
@@ -302,9 +473,21 @@ class DocumentContext(_LLMBase):
     fiscal_year_end: Optional[str] = Field(description="'MM-DD', or null.")
 
 
+class Scratchpad(_LLMBase):
+    """Working space, generated FIRST (quote -> plan -> verify) so the chunks that follow are
+    grounded in it. Code stores it in the run report for review and never uses it as data."""
+
+    evidence_quotes: list[str] = Field(
+        description="Lines that set context, each as 'Lnnnn <short quote> -> <what it sets>'."
+    )
+    outline: list[str] = Field(description="Planned chunks in order, each as 'Lstart-Lend <header_path> (<section>)'.")
+    plan_check: str = Field(description="Result of each verification checklist item, in a few words.")
+
+
 class LLMResponse(_LLMBase):
     """Chunk boundaries and metadata for one document. No chunk text."""
 
+    scratchpad: Scratchpad  # first property -> generated before document and chunks
     document: DocumentContext
     chunks: list[LLMChunk]
 
@@ -348,6 +531,7 @@ class RunReport(BaseModel):
     retries: int = 0
     degraded: bool = False
     response_cache_hit: bool = False
+    scratchpad: Optional[dict[str, Any]] = None  # the LLM's quotes / outline / plan_check (review only)
     validation_errors: list[str] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
     latest_annual_end: Optional[date] = None
@@ -468,28 +652,37 @@ def doc_id_for(name: str, markdown: str) -> str:
 # =========================================================================== #
 # Prompt layout
 # =========================================================================== #
+DOCUMENT_SLOT = "{{DOCUMENT}}"
+
+
 def build_system_prompt(system_prompt: str, doc: SourceDoc) -> str:
-    """Stable, cacheable prefix: rules + numbered document. No timestamps or IDs."""
-    return f"{system_prompt}\n<document>\n{doc.numbered()}\n</document>"
+    """Stable, cacheable prefix. The long document sits near the top, above the instructions
+    and examples; the short task message comes last. No timestamps or IDs."""
+    return system_prompt.replace(DOCUMENT_SLOT, doc.numbered(), 1)
 
 
 def task_message(doc: SourceDoc, max_chunk_lines: int) -> dict[str, str]:
     spans = ", ".join(f"L{a}-L{b}" for a, b in doc.table_spans) or "none"
     return {"role": "user", "content": (
+        f"<task>\n"
         f"The document has {doc.n} lines (L1 to L{doc.n}).\n"
-        f"Table spans (do not cut inside): {spans}\n"
+        f"Table spans (keep each inside one chunk): {spans}\n"
         f"MAX_CHUNK_LINES = {max_chunk_lines}\n\n"
-        "Give the document context and the full chunk list in the output format."
+        "Fill the scratchpad first: quote the context lines, outline the chunks, then check the "
+        "outline against the verification checklist and fix it there. Then give the document "
+        "context and the full chunk list, matching the checked outline.\n"
+        "</task>"
     )}
 
 
 def repair_message(errors: list[str]) -> dict[str, str]:
     bullets = "\n".join(f"- {e}" for e in errors)
     return {"role": "user", "content": (
-        f"Your previous response failed validation:\n{bullets}\n\n"
-        "Give a corrected, complete response. Change only the chunks that you must change to "
-        "fix these errors. Keep all other chunks and metadata the same. Cover every line exactly "
-        "once, in order, and do not cut inside a table span."
+        f"<validation_errors>\n{bullets}\n</validation_errors>\n\n"
+        "Code found these errors in your previous response. Give a corrected, complete response. "
+        "In the scratchpad, write a new outline that fixes each error and run the verification "
+        "checklist again. Change only the chunks that the errors affect, and keep all other "
+        "chunks and metadata the same."
     )}
 
 
@@ -993,6 +1186,7 @@ async def chunk_document(label: str, markdown: str, settings: Settings) -> Chunk
         llm_chunks, ctx = fallback_chunks(doc), empty_context()
     else:
         llm_chunks, ctx = resp.chunks, resp.document
+        report.scratchpad = resp.scratchpad.model_dump()
 
     report.warnings += check_document_evidence(ctx, doc)
     chunks: list[Chunk] = []
@@ -1085,6 +1279,8 @@ def _P(label: str, end: str | None, months: int | None, ptype: str, line: int) -
 def _good_response() -> dict[str, Any]:
     """A correct response for FINANCIAL_DOCUMENT (61 lines; tables L20-25, L29-33, L40-54, L58-61)."""
     return {
+        "scratchpad": {"evidence_quotes": ["L0004 (in thousands of Canadian dollars) -> scale thousands, CAD"],
+                       "outline": ["L1-L5 Preamble (preamble)"], "plan_check": "Coverage complete."},
         "document": {"entity_name": "NORTHWIND MUTUAL INSURANCE COMPANY", "document_type": "audited financial statements",
                      "basis": "ifrs", "default_currency": "CAD", "default_scale": "thousands",
                      "default_scale_evidence_line": 4, "fiscal_year_end": "12-31"},
@@ -1153,7 +1349,9 @@ def _run_fake(monkeypatch: Any, responses: list[Any], **overrides: Any) -> tuple
     monkeypatch.setattr(sys.modules[__name__], "build_agent", fake_build_agent)
     settings = Settings(response_cache_dir=None, **overrides)
     result = asyncio.run(chunk_document(FINANCIAL_DOCUMENT_NAME, FINANCIAL_DOCUMENT, settings))
-    assert len(built) == 1 and built[0].startswith(SYSTEM_PROMPT) and "L0061 | Combined ratio" in built[0]
+    head, tail = SYSTEM_PROMPT.split(DOCUMENT_SLOT)
+    assert len(built) == 1 and built[0].startswith(head) and built[0].endswith(tail)
+    assert "L0061 | Combined ratio" in built[0] and DOCUMENT_SLOT not in built[0]
     return result, calls
 
 
@@ -1290,3 +1488,39 @@ def test_model_request_carries_cache_settings_and_strict_schema(monkeypatch: Any
     fmt = payload["text"]["format"]
     assert fmt["type"] == "json_schema" and fmt["strict"] is True
     assert set(fmt["schema"]["required"]) == set(LLMResponse.model_fields)
+
+
+def test_prompt_structure_follows_best_practices() -> None:
+    """Document above the instructions, XML sections, scratchpad before data, calm wording."""
+    for tag in ("document", "context", "boundary_rules", "metadata_rules", "evidence_rules",
+                "scratchpad", "verification_checklist", "examples"):
+        assert f"<{tag}>" in SYSTEM_PROMPT and f"</{tag}>" in SYSTEM_PROMPT, tag
+    assert SYSTEM_PROMPT.count(DOCUMENT_SLOT) == 1
+    assert SYSTEM_PROMPT.index("<document>") < SYSTEM_PROMPT.index("<boundary_rules>")
+    assert SYSTEM_PROMPT.count("<example>") == 3
+    assert list(LLMResponse.model_fields)[0] == "scratchpad"
+    for shouty in ("NEVER", "MUST", "CRITICAL", "IMPORTANT", "Do not", "do not"):
+        assert shouty not in SYSTEM_PROMPT, shouty
+    task = task_message(_doc(), 60)["content"]
+    assert task.startswith("<task>") and "scratchpad first" in task
+
+
+def test_prompt_examples_are_valid_and_pass_validation() -> None:
+    """Each worked example parses into the schema and passes the same checks as real output."""
+    blocks = re.findall(r"<input>\n(.*?)</input>\n<output>\n(.*?)</output>", SYSTEM_PROMPT, re.S)
+    assert len(blocks) == 3
+    for numbered, output in blocks:
+        rows = [line for line in numbered.splitlines() if line.startswith("L")]
+        md = "".join(re.sub(r"^L\d{4} ?", "", line) + "\n" for line in rows)
+        doc = SourceDoc(md, Settings().page_marker_regex)
+        spans = re.search(r"Table spans: (.*)", numbered).group(1)
+        assert ", ".join(f"L{a}-L{b}" for a, b in doc.table_spans) == spans
+        resp, errs = check_schema(json.loads(output))
+        assert resp is not None, errs
+        assert structural_errors(resp, doc) == []
+        ctx = resp.document.model_copy(deep=True)
+        assert check_document_evidence(ctx, doc) == []
+        for lc in resp.chunks:
+            c = to_chunk(lc, doc, "ex")
+            check_chunk_evidence(c, doc, ctx)
+            assert c.warnings == [], c.warnings
