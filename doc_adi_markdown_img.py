@@ -14,9 +14,11 @@ Routing
     .docx .pptx .xlsx .csv .txt/.md   parsed natively, exact, no OCR, no cost
     .doc .ppt .xls .rtf .odt ...       LibreOffice -> modern format -> native parser
     .json (ADI analyzeResult)          analyzeResult.content -> normalizer
-    .pdf                               text pages: PyMuPDF text + tables
-                                       scanned pages: rendered -> vision model
+    .pdf                               page with visible text: PyMuPDF text + tables
+                                       page without visible text (scan): rendered -> vision
                                        (or Azure Document Intelligence when configured)
+    picture filter (every format)      only real figures go to vision; backgrounds,
+                                       watermarks, logos, gradients, rule lines are skipped
     images                             vision model (or ADI when configured)
     every picture / chart / scan       vision model, two passes:
                                        1. overview  - all images in one call
@@ -27,7 +29,7 @@ Vision model: OpenAI GPT (default gpt-5.4) through LangChain v1 ChatOpenAI on th
 Responses API, image detail "original", structured JSON output (strict schema).
 
 Environment (a .env file next to this script or in the working directory is loaded)
-    OPENAI_API_KEY                      required when the file has images or scans
+    OPENAI_API_KEY                      required when a figure or scan must be read (not cached)
     OPENAI_BASE_URL                     optional: OpenAI-compatible gateway
     AZURE_DI_ENDPOINT, AZURE_DI_KEY     optional: ADI for PDFs and image files
 
@@ -76,7 +78,9 @@ from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, Callable, Optional, Sequence
 
-from PIL import Image, ImageOps
+from collections import Counter
+
+from PIL import Image, ImageChops, ImageFilter, ImageOps, ImageStat
 from pydantic import BaseModel, Field
 
 log = logging.getLogger("doc2md")
@@ -110,18 +114,33 @@ class Settings:
     min_image_px: int = 48               # ignore icons / bullets smaller than this
     # --- zoom pass ---
     zoom_rounds: int = 1                 # 0 disables the zoom pass
-    zoom_confidence: float = 0.9         # below this an image is always re-checked
+    zoom_confidence: float = 0.8         # pass 2 runs if confidence is below this (or regions flagged)
     max_zooms_per_image: int = 6         # regions the model may flag per image
-    max_auto_tiles: int = 12             # automatic tiles per image (full coverage)
+    max_auto_tiles: int = 12             # automatic tiles per whole-page image (full coverage)
     zoom_padding: float = 0.18           # padding around a flagged region (OpenAI cookbook)
     tile_overlap: float = 0.10
+    # --- vision cache ---
+    use_cache: bool = True
+    cache_dir: str = "~/.cache/doc2md"
     # --- routing ---
     use_adi: str = "auto"                # auto | always | never  (PDF and image files)
     pdf_mode: str = "auto"               # auto | text | vision
-    render_dpi: int = 300                # scanned pages / figures rendered at this DPI
-    scan_text_chars: int = 80            # a PDF page with fewer text chars is a scan
-    scan_image_cover: float = 0.9        # a page this covered by one image is a scan
+    render_dpi: int = 300                # figure crops are rendered at this DPI (at least)
+    scan_dpi: int = 200                  # whole-page scans: enough for 9 pt text with detail="original"
+    scan_text_chars: int = 80            # a PDF page with fewer VISIBLE text chars is a scan
     vector_figures: bool = True          # send vector charts in PDFs to the vision model
+    vector_min_paths: int = 6            # vector clusters with fewer paths are boxes / panels / rules
+    vector_background_words: int = 45    # prose on a large vector cluster: it is a background
+    # --- picture filter (classify_picture) ---
+    decorative_std: float = 10.0         # 64x64 greyscale std below this: plain picture
+    decorative_flat_ratio: float = 0.97  # share of near-white / one-colour pixels above this
+    decorative_edge_ratio: float = 0.002 # almost no sharp edges: gradient, blur, soft texture
+    banner_ratio: float = 15.0           # aspect ratio above this: rule line or banner
+    background_cover: float = 0.5        # PDF: picture covers this share of the page ...
+    background_words: int = 15           # ... and this many visible words lie on it
+    covered_words: int = 20              # PDF: this many words on a non-chart picture
+    slide_background_cover: float = 0.8  # PPTX: picture covers this share of the slide, behind text
+    slide_page_cover: float = 0.8        # PPTX picture-only slide: one picture this big -> whole page
     skip_repeated_images: bool = True    # logos on most pages/slides
     include_hidden: bool = True          # hidden slides / sheets (marked as hidden)
     include_notes: bool = True           # speaker notes
@@ -595,8 +614,102 @@ def png_bytes(im: Image.Image) -> bytes:
     return buf.getvalue()
 
 
-def data_url(im: Image.Image) -> str:
-    return "data:image/png;base64," + base64.b64encode(png_bytes(im)).decode()
+def data_url(png: bytes) -> str:
+    return "data:image/png;base64," + base64.b64encode(png).decode()
+
+
+# ---------------------------------------------------------------- picture filter
+@dataclass
+class Thumb:
+    """Small views of a picture for the filter: costs milliseconds, not a vision call."""
+    grey: Image.Image              # 64x64 greyscale, dark strokes dilated (thin lines survive)
+    rgb: Image.Image               # 32x32 colour
+    w: int                         # original pixel size (for logs and aspect ratio)
+    h: int
+
+
+def make_thumb(im: Image.Image, size: Optional[tuple[int, int]] = None) -> Thumb:
+    im = to_rgb(im)
+    w, h = size or im.size
+    k = min(1.0, 256 / max(im.size))
+    small = im.resize((max(1, round(im.width * k)), max(1, round(im.height * k))),
+                      Image.BILINEAR, reducing_gap=2.0) if k < 1 else im
+    rgb = small.convert("RGB").resize((32, 32), Image.BOX)
+    grey = small.convert("L").filter(ImageFilter.MinFilter(5)).resize((64, 64), Image.BOX)
+    return Thumb(grey, rgb, w, h)
+
+
+def thumb_from_bytes(blob: bytes) -> Optional[Thumb]:
+    try:
+        im = Image.open(io.BytesIO(blob))
+        size = im.size
+        try:
+            im.draft("RGB", (512, 512))    # JPEG: decode at reduced size (fast)
+        except Exception:  # noqa: BLE001
+            pass
+        im.load()
+        return make_thumb(im, size)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def picture_features(t: Thumb) -> tuple[float, float, float, bool]:
+    """(std, flat share, sharp-edge share, chart-like) of a thumbnail."""
+    g = t.grey
+    std = ImageStat.Stat(g).stddev[0]
+    hist = g.histogram()
+    total = sum(hist) or 1
+    mode = max(range(256), key=hist.__getitem__)
+    flat = max(sum(hist[240:]), sum(hist[max(0, mode - 6):mode + 7])) / total
+    gw, gh = g.size
+    dx = ImageChops.difference(g.crop((0, 0, gw - 1, gh)), g.crop((1, 0, gw, gh))).histogram()
+    dy = ImageChops.difference(g.crop((0, 0, gw, gh - 1)), g.crop((0, 1, gw, gh))).histogram()
+    edges = (sum(dx[33:]) + sum(dy[33:])) / max(1, (gw - 1) * gh + gw * (gh - 1))
+    b = t.rgb.tobytes()
+    px = list(zip(b[0::3], b[1::3], b[2::3]))
+    white = sum(1 for p in px if min(p) >= 230) / len(px)
+    bins = Counter((r >> 6, gg >> 6, bb >> 6) for r, gg, bb in px)
+    major = sum(1 for v in bins.values() if v >= 0.02 * len(px))
+    chart_like = white >= 0.35 and major <= 10    # mostly white with a few flat colours
+    return std, flat, edges, chart_like
+
+
+def classify_picture(t: Optional[Thumb], s: Settings, *, fmt: str = "docx", aspect: Optional[float] = None,
+                     cover: float = 0.0, words_on: int = 0, behind_text: bool = False,
+                     is_chart: Optional[bool] = None) -> str:
+    """Return "figure" | "background" | "decorative" | "covered". Only "figure" goes to vision.
+
+    fmt "pdf": background = covers >= background_cover of the page with >= background_words
+               visible words on it; covered = >= covered_words words on a picture that is
+               not a chart (the text layer already has the content).
+    fmt "pptx": background = covers >= slide_background_cover and is behind a text shape.
+    Every format: decorative = plain / near-white / one-colour / edge-free picture, or a banner.
+    """
+    if aspect is None and t is not None:
+        aspect = t.w / max(1, t.h)
+    if aspect and max(aspect, 1 / aspect) > s.banner_ratio:
+        return "decorative"
+    chart_like = False
+    if t is not None:
+        std, flat, edges, chart_like = picture_features(t)
+        if std < s.decorative_std or flat > s.decorative_flat_ratio or edges < s.decorative_edge_ratio:
+            return "decorative"
+    is_chart = chart_like if is_chart is None else is_chart
+    if fmt == "pdf":
+        if cover >= s.background_cover and words_on >= s.background_words:
+            return "background"
+        if words_on >= s.covered_words and not is_chart:
+            return "covered"
+    elif fmt == "pptx":
+        if cover >= s.slide_background_cover and behind_text:
+            return "background"
+    return "figure"
+
+
+def skipped_str(tally: Counter) -> str:
+    """'1 background, 2 decorative skipped' from a tally (keys other than 'sent')."""
+    parts = [f"{v} {k}" for k, v in sorted(tally.items()) if k != "sent" and v]
+    return (", ".join(parts) + " skipped") if parts else ""
 
 
 @dataclass
@@ -609,6 +722,7 @@ class ImageItem:
     ocr_text: str = ""             # exact OCR text when ADI read it
     caption: str = ""
     sha: str = ""
+    scan: bool = False             # a scanned page / image file, not a picture inside a page
 
 
 class ImageRegistry:
@@ -618,10 +732,48 @@ class ImageRegistry:
         self.s = settings
         self.work_dir = work_dir
         self.items: dict[str, ImageItem] = {}
+        self.skipped: list[tuple[int, str, str]] = []     # (unit, reason, context)
         self._by_hash: dict[str, Optional[str]] = {}
+        self._thumbs: dict[str, Optional[Thumb]] = {}
+        self._raster: dict[str, bytes] = {}               # vector pictures rasterized once
         self._n = 0
 
-    def add_blob(self, blob: bytes, unit: int, ext: str = "", context: str = "") -> Optional[str]:
+    # -- filter
+    def thumb(self, blob: bytes, ext: str = "") -> Optional[Thumb]:
+        sha = hashlib.sha1(blob).hexdigest()
+        if sha not in self._thumbs:
+            t = thumb_from_bytes(blob)
+            if t is None:
+                im = self._open(blob, ext)
+                t = make_thumb(im) if im is not None else None
+            self._thumbs[sha] = t
+        return self._thumbs[sha]
+
+    def skip(self, unit: int, reason: str, t: Optional[Thumb], context: str) -> None:
+        self.skipped.append((unit, reason, context))
+        log.debug("skipped picture (%s): %s, %s px", reason, context,
+                  f"{t.w}x{t.h}" if t else "unknown size")
+
+    def offer_blob(self, blob: bytes, unit: int, ext: str, context: str, tally: Counter,
+                   kind: str = "figure", **geom) -> Optional[str]:
+        """Classify an embedded picture; register it only if it is a real figure."""
+        t = self.thumb(blob, ext)
+        if t is not None and min(t.w, t.h) < self.s.min_image_px:
+            verdict = "small"
+        else:
+            verdict = classify_picture(t, self.s, **geom)
+        if verdict != "figure":
+            self.skip(unit, verdict, t, context)
+            tally[verdict] += 1
+            return None
+        ph = self.add_blob(blob, unit, ext, context, kind)
+        if ph and ph.startswith("<<"):
+            tally["sent"] += 1
+        return ph
+
+    # -- registration
+    def add_blob(self, blob: bytes, unit: int, ext: str = "", context: str = "",
+                 kind: str = "figure") -> Optional[str]:
         """Add an embedded picture. Returns a placeholder, a note, or None (skipped)."""
         sha = hashlib.sha1(blob).hexdigest()
         if sha in self._by_hash:
@@ -635,21 +787,21 @@ class ImageRegistry:
         if im is None:
             self._by_hash[sha] = None
             return f"_(picture in {ext or 'unknown'} format could not be read)_"
-        img_id = self._add(im, "figure", unit, context, sha)
+        img_id = self._add(im, kind, unit, context, sha)
         self._by_hash[sha] = img_id
         return placeholder(img_id) if img_id else None
 
     def add_image(self, im: Image.Image, unit: int, kind: str, context: str = "",
-                  ocr_text: str = "", caption: str = "") -> Optional[str]:
-        img_id = self._add(to_rgb(im), kind, unit, context, "", ocr_text, caption)
+                  ocr_text: str = "", caption: str = "", scan: bool = False) -> Optional[str]:
+        img_id = self._add(to_rgb(im), kind, unit, context, "", ocr_text, caption, scan)
         return placeholder(img_id) if img_id else None
 
-    def _add(self, im, kind, unit, context, sha, ocr_text="", caption="") -> Optional[str]:
+    def _add(self, im, kind, unit, context, sha, ocr_text="", caption="", scan=False) -> Optional[str]:
         if kind == "figure" and min(im.size) < self.s.min_image_px:
             return None
         self._n += 1                       # ids stay unique even after drop_repeated()
         img_id = f"IMG_{self._n}"
-        self.items[img_id] = ImageItem(img_id, kind, im, [unit], context, ocr_text, caption, sha)
+        self.items[img_id] = ImageItem(img_id, kind, im, [unit], context, ocr_text, caption, sha, scan)
         return img_id
 
     def _open(self, blob: bytes, ext: str) -> Optional[Image.Image]:
@@ -659,19 +811,22 @@ class ImageRegistry:
             return to_rgb(im)
         except Exception:  # noqa: BLE001
             pass
-        # EMF / WMF / SVG and other vector pictures: rasterize with LibreOffice
+        # EMF / WMF / SVG and other vector pictures: rasterize with LibreOffice (once)
         ext = (ext or "bin").lstrip(".").lower()
         if ext not in ("emf", "wmf", "svg", "emz", "wmz", "eps", "pict", "tif", "tiff"):
             return None
+        sha = hashlib.sha1(blob).hexdigest()
         try:
-            src = self.work_dir / f"vec_{hashlib.sha1(blob).hexdigest()[:12]}.{ext}"
-            src.write_bytes(blob)
-            out = soffice_convert(src, "png", self.work_dir, timeout=120)
-            im = Image.open(out)
+            if sha not in self._raster:
+                src = self.work_dir / f"vec_{sha[:12]}.{ext}"
+                src.write_bytes(blob)
+                self._raster[sha] = soffice_convert(src, "png", self.work_dir, timeout=120).read_bytes()
+            im = Image.open(io.BytesIO(self._raster[sha]))
             im.load()
             return to_rgb(im)
         except Exception as exc:  # noqa: BLE001
             log.debug("could not rasterize %s picture: %s", ext, exc)
+            self._raster.setdefault(sha, b"")
             return None
 
     def drop_repeated(self, n_units: int) -> list[str]:
@@ -842,8 +997,58 @@ def convert_pptx(path: Path, reg: ImageRegistry, s: Settings) -> Converted:
         except Exception:  # noqa: BLE001
             return ""
 
-    def blips(shape, slide, unit, ctx) -> list[str]:
+    # ---- geometry and z-order (slide EMU; z = spTree position, back to front; a shape in a
+    # group is ordered by the group's index first, then by its index inside the group)
+    ns_p = "http://schemas.openxmlformats.org/presentationml/2006/main"
+    slide_w, slide_h = int(prs.slide_width or 9144000), int(prs.slide_height or 6858000)
+    slide_rect = (0, 0, slide_w, slide_h)
+
+    def identity(x, y, w, h):
+        return x, y, w, h
+
+    def group_map(grp, parent):
+        """Child coordinates of a group -> slide coordinates (a:off/ext/chOff/chExt)."""
+        xf = grp._element.find(f"{{{ns_p}}}grpSpPr/{{{ns_a}}}xfrm")
+        if xf is None:
+            return parent
+
+        def pair(tag, a, b):
+            e = xf.find(f"{{{ns_a}}}{tag}")
+            return (int(e.get(a, 0)), int(e.get(b, 0))) if e is not None else (0, 0)
+        (ox, oy), (cx, cy) = pair("off", "x", "y"), pair("ext", "cx", "cy")
+        (chx, chy), (chcx, chcy) = pair("chOff", "x", "y"), pair("chExt", "cx", "cy")
+        sx, sy = (cx / chcx if chcx else 1.0), (cy / chcy if chcy else 1.0)
+        return lambda x, y, w, h: parent(ox + (x - chx) * sx, oy + (y - chy) * sy, w * sx, h * sy)
+
+    def rect_of(sh, m):
+        return m(sh.left or 0, sh.top or 0, sh.width or 0, sh.height or 0)
+
+    def overlap(a, b) -> float:
+        return (max(0, min(a[0] + a[2], b[0] + b[2]) - max(a[0], b[0]))
+                * max(0, min(a[1] + a[3], b[1] + b[3]) - max(a[1], b[1])))
+
+    def own_text(sh) -> bool:
+        return bool(sh.has_text_frame and sh.text_frame.text.strip()) or \
+            bool(getattr(sh, "has_table", False) and sh.has_table)
+
+    def text_shapes(shapes, m, prefix, out):
+        """(z, rect) of every shape that carries text, in z-order."""
+        for k, sh in enumerate(shapes):
+            z = prefix + (k,)
+            if sh.shape_type == MSO_SHAPE_TYPE.GROUP:
+                text_shapes(sh.shapes, group_map(sh, m), z, out)
+            elif own_text(sh):
+                out.append((z, rect_of(sh, m)))
+        return out
+
+    # ---- pictures: every blip goes through the shared picture filter
+    def blips(shape, slide, unit, ctx, z, rect, texts, tally) -> list[str]:
         out = []
+        has_own_text = own_text(shape)          # a picture fill is drawn behind its own text
+        cover = overlap(rect, slide_rect) / (slide_w * slide_h)
+        behind = has_own_text or any(tz > z and overlap(tr, rect) > 0 for tz, tr in texts)
+        aspect = rect[2] / rect[3] if rect[2] > 0 and rect[3] > 0 else None
+        kind = "page" if not texts and cover >= s.slide_page_cover else "figure"
         for blip in shape._element.iter(f"{{{ns_a}}}blip"):
             rid = blip.get(f"{{{ns_r}}}embed")
             if not rid:
@@ -852,16 +1057,22 @@ def convert_pptx(path: Path, reg: ImageRegistry, s: Settings) -> Converted:
                 part = slide.part.related_part(rid)
             except KeyError:
                 continue
-            ph = reg.add_blob(part.blob, unit, Path(str(part.partname)).suffix, ctx)
+            ph = reg.offer_blob(part.blob, unit, Path(str(part.partname)).suffix, ctx, tally,
+                                kind=kind, fmt="pptx", aspect=aspect, cover=cover, behind_text=behind)
             if ph:
                 out.append(ph)
+                if kind == "page" and ph.startswith("<<"):
+                    tally["page"] += 1
         return out
 
-    def shapes_md(shapes, slide, unit, ctx) -> list[str]:
+    def shapes_md(shapes, slide, unit, ctx, m, prefix, texts, tally) -> list[str]:
         blocks = []
-        for sh in reading_order(list(shapes)):
+        shapes = list(shapes)
+        zpos = {id(sh): k for k, sh in enumerate(shapes)}
+        for sh in reading_order(shapes):
+            z = prefix + (zpos[id(sh)],)
             if sh.shape_type == MSO_SHAPE_TYPE.GROUP:
-                blocks += shapes_md(sh.shapes, slide, unit, ctx)
+                blocks += shapes_md(sh.shapes, slide, unit, ctx, group_map(sh, m), z, texts, tally)
                 continue
             if getattr(sh, "has_table", False) and sh.has_table:
                 blocks.append(table_md(sh.table))
@@ -878,10 +1089,11 @@ def convert_pptx(path: Path, reg: ImageRegistry, s: Settings) -> Converted:
                 t = text_frame_md(sh.text_frame, is_title)
                 if t:
                     blocks.append(t)
-            blocks += blips(sh, slide, unit, ctx)  # pictures, picture fills, OLE previews
+            # pictures, picture fills, OLE previews (slide master / layout pictures are not read)
+            blocks += blips(sh, slide, unit, ctx, z, rect_of(sh, m), texts, tally)
         return [b for b in blocks if b]
 
-    pages = []
+    pages, pages_text, pages_pics = [], 0, 0
     for n, slide in enumerate(prs.slides, start=1):
         hidden = slide._element.get("show") in ("0", "false")
         if hidden and not s.include_hidden:
@@ -891,7 +1103,9 @@ def convert_pptx(path: Path, reg: ImageRegistry, s: Settings) -> Converted:
         if slide.shapes.title is not None and slide.shapes.title.has_text_frame:
             title = slide.shapes.title.text_frame.text.strip()
         ctx = f"slide {n}" + (f": {title}" if title else "")
-        blocks = shapes_md(slide.shapes, slide, n, ctx)
+        texts = text_shapes(slide.shapes, identity, (), [])
+        tally: Counter = Counter()
+        blocks = shapes_md(slide.shapes, slide, n, ctx, identity, (), texts, tally)
         if hidden:
             blocks.insert(0, "_(hidden slide)_")
         if s.include_notes and slide.has_notes_slide:
@@ -900,9 +1114,21 @@ def convert_pptx(path: Path, reg: ImageRegistry, s: Settings) -> Converted:
             if notes:
                 blocks.append("> **Speaker notes:** " + notes.replace("\n", "\n> "))
         pages.append("\n\n".join(blocks))
+
+        # one log line per slide
+        sent, page_pics = tally["sent"], tally.pop("page", 0)
+        msg = f"slide {n}: " + ("text" if texts else "pictures only" if sent else "no text")
+        if sent:
+            msg += f" + {sent} picture(s) -> vision" + (" (whole page)" if page_pics else "")
+        if skipped_str(tally):
+            msg += "; " + skipped_str(tally)
+        log.info("%s", msg)
+        pages_text += bool(texts)
+        pages_pics += bool(page_pics)
     title = (prs.core_properties.title or "").strip()
     return Converted(f"\n\n{PAGEBREAK_TAG}\n\n".join(pages), len(pages),
-                     {"format": "pptx", **({"doc_title": title} if title else {})})
+                     {"format": "pptx", "pages_text": pages_text, "pages_scanned": pages_pics,
+                      **({"doc_title": title} if title else {})})
 
 
 # ---------------------------------------------------------------- Word
@@ -927,6 +1153,7 @@ class _DocxWalker:
     def __init__(self, part, reg: ImageRegistry, s: Settings):
         self.part, self.reg, self.s = part, reg, s
         self.unit = 1
+        self.tally: Counter = Counter()
 
     def walk(self, el, text: list[str], pics: list[str], ctx: str, top=None) -> bool:
         """Append text and picture placeholders. Returns True if a page break was found."""
@@ -958,7 +1185,8 @@ class _DocxWalker:
             rid = el.get(_q(R, "embed")) or el.get(_q(R, "id"))
             if rid and rid in self.part.related_parts:
                 p = self.part.related_parts[rid]
-                ph = self.reg.add_blob(p.blob, self.unit, Path(str(p.partname)).suffix, ctx)
+                ph = self.reg.offer_blob(p.blob, self.unit, Path(str(p.partname)).suffix, ctx,
+                                         self.tally, fmt="docx")
                 if ph:
                     pics.append(ph)
         elif tag == _q(W, "p") and el is not top:
@@ -1055,6 +1283,9 @@ def convert_docx(path: Path, reg: ImageRegistry, s: Settings) -> Converted:
             blocks.append(f"## {kind.capitalize()}\n\n" + "\n".join(notes))
 
     body = "\n\n".join(b for b in blocks if b)
+    sk = skipped_str(walker.tally)
+    log.info("docx: text (%d page(s)) | %d picture(s) -> vision%s", page, walker.tally["sent"],
+             f"; {sk}" if sk else "")
     title = (d.core_properties.title or "").strip()
     return Converted(body, page, {"format": "docx", **({"doc_title": title} if title else {})})
 
@@ -1091,6 +1322,7 @@ def convert_xlsx(path: Path, reg: ImageRegistry, s: Settings) -> Converted:
     except Exception:  # noqa: BLE001
         wbf = None
     pages, uncached = [], 0
+    tally: Counter = Counter()
 
     for n, ws in enumerate(wb.worksheets, start=1):
         hidden = ws.sheet_state != "visible"
@@ -1156,7 +1388,8 @@ def convert_xlsx(path: Path, reg: ImageRegistry, s: Settings) -> Converted:
                 blocks_md.append("**Chart:** (data is in the cells above)")
         for img in getattr(ws, "_images", []):
             try:
-                ph = reg.add_blob(img._data(), unit, getattr(img, "format", "png"), f"sheet {ws.title}")
+                ph = reg.offer_blob(img._data(), unit, getattr(img, "format", "png"), f"sheet {ws.title}",
+                                    tally, fmt="xlsx")
                 if ph:
                     blocks_md.append(ph)
             except Exception as exc:  # noqa: BLE001
@@ -1167,6 +1400,9 @@ def convert_xlsx(path: Path, reg: ImageRegistry, s: Settings) -> Converted:
     if uncached:
         log.warning("%d formula cells have no saved value (shown as `=FORMULA`). "
                     "Open and save the file in Excel to store the values.", uncached)
+    if tally:
+        log.info("xlsx: %d picture(s) -> vision%s", tally["sent"],
+                 f"; {skipped_str(tally)}" if skipped_str(tally) else "")
     title = (wb.properties.title or "").strip() if wb.properties else ""
     return Converted(f"\n\n{PAGEBREAK_TAG}\n\n".join(pages), len(pages),
                      {"format": "xlsx", "sheets": len(pages), **({"doc_title": title} if title else {})})
@@ -1231,11 +1467,10 @@ def _render_clip(page, rect, dpi: int) -> Image.Image:
     return Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
 
 
-def _page_dpi_for_budget(page, s: Settings, rect=None) -> int:
-    """Highest DPI <= render_dpi that keeps the region inside the per-image patch limit."""
-    rect = rect or page.rect
+def _dpi_for_budget(rect, s: Settings, start: int) -> int:
+    """Highest DPI <= start that keeps the region inside the per-image patch and side limits."""
     w_in, h_in = rect.width / 72, rect.height / 72
-    dpi = s.render_dpi
+    dpi = start
     while dpi > 72 and (patch_count(int(w_in * dpi), int(h_in * dpi), s) > s.max_patches_per_image
                         or max(w_in, h_in) * dpi > s.max_side_px):
         dpi -= 10
@@ -1251,6 +1486,50 @@ def _pdf_markdown_fn():
         return None
 
 
+def _span_visible(sp: dict) -> bool:
+    """Text trace span that is painted: not render mode 3 (OCR layer of searchable scans), not transparent."""
+    op = sp.get("opacity")
+    return sp.get("type") != 3 and (op is None or op > 0)
+
+
+def _is_space(code: int) -> bool:
+    return code < 0 or chr(code).isspace()
+
+
+def visible_chars(page) -> int:
+    """Characters of visible text on a PDF page (invisible OCR text does not count)."""
+    try:
+        return sum(1 for sp in page.get_texttrace() if _span_visible(sp)
+                   for ch in sp.get("chars", ()) if not _is_space(ch[0]))
+    except Exception:  # noqa: BLE001
+        return len(page.get_text().strip())
+
+
+def visible_word_centres(page) -> Optional[list[tuple[float, float]]]:
+    """Centre point of every visible word; None if the text trace is not available."""
+    try:
+        trace = page.get_texttrace()
+    except Exception:  # noqa: BLE001
+        return None
+    pts = []
+    for sp in trace:
+        if not _span_visible(sp):
+            continue
+        box = None
+        for ch in sp.get("chars", ()):
+            if _is_space(ch[0]):
+                if box:
+                    pts.append(((box[0] + box[2]) / 2, (box[1] + box[3]) / 2))
+                box = None
+                continue
+            b = ch[3]
+            box = list(b) if box is None else [min(box[0], b[0]), min(box[1], b[1]),
+                                               max(box[2], b[2]), max(box[3], b[3])]
+        if box:
+            pts.append(((box[0] + box[2]) / 2, (box[1] + box[3]) / 2))
+    return pts
+
+
 def convert_pdf(path: Path, reg: ImageRegistry, s: Settings) -> Converted:
     import pymupdf
 
@@ -1262,41 +1541,80 @@ def convert_pdf(path: Path, reg: ImageRegistry, s: Settings) -> Converted:
     if doc.needs_pass and not doc.authenticate(""):
         raise EncryptedFileError(f"{path.name}: the PDF is password-protected. Remove the password and try again.")
     rag_markdown = _pdf_markdown_fn()
+    xref_thumbs: dict[int, Optional[Thumb]] = {}
 
-    pages_md = []
+    def raster_thumb(page, info, rect) -> Optional[Thumb]:
+        """Thumbnail of the image itself (not of the text drawn over it); render as fallback."""
+        xref = info.get("xref") or 0
+        if xref > 0:
+            if xref not in xref_thumbs:
+                try:
+                    xref_thumbs[xref] = thumb_from_bytes(doc.extract_image(xref)["image"])
+                except Exception:  # noqa: BLE001
+                    xref_thumbs[xref] = None
+            if xref_thumbs[xref] is not None:
+                return xref_thumbs[xref]
+        try:
+            return make_thumb(_render_clip(page, rect, 72))
+        except Exception:  # noqa: BLE001
+            return None
+
+    pages_md, pages_text, pages_scanned = [], 0, 0
     for i, page in enumerate(doc):
         n = i + 1
         area = abs(page.rect) or 1
-        chars = len(page.get_text().strip())
-        infos = [x for x in page.get_image_info(xrefs=True) if x.get("bbox")]
-        cover = max((abs(pymupdf.Rect(x["bbox"]) & page.rect) / area for x in infos), default=0)
-        scanned = s.pdf_mode == "vision" or (
-            s.pdf_mode == "auto" and (chars < s.scan_text_chars or cover >= s.scan_image_cover))
+        vis = visible_chars(page)
+        scanned = s.pdf_mode == "vision" or (s.pdf_mode == "auto" and vis < s.scan_text_chars)
 
         if scanned:
-            dpi = _page_dpi_for_budget(page, s)
-            ph = reg.add_image(_render_clip(page, page.rect, dpi), n, "page", f"page {n} (whole page)")
+            dpi = _dpi_for_budget(page.rect, s, s.scan_dpi)
+            ph = reg.add_image(_render_clip(page, page.rect, dpi), n, "page", f"page {n} (whole page)",
+                               scan=True)
             pages_md.append(ph or "")
+            pages_scanned += 1
+            log.info("page %d: scan (%d visible chars) -> whole page -> vision", n, vis)
             continue
+        pages_text += 1
 
+        pts = visible_word_centres(page)
+
+        def words_on(rect) -> int:
+            if pts is None:
+                return len(page.get_text("words", clip=rect))
+            return sum(1 for x, y in pts if rect.x0 <= x <= rect.x1 and rect.y0 <= y <= rect.y1)
+
+        tally: Counter = Counter()
         figs, fig_rects = [], []
-        # raster pictures: render the region (keeps overlaid labels) at native density
+        # raster pictures: filter first; real figures are rendered at native density
+        infos = [x for x in page.get_image_info(xrefs=True) if x.get("bbox")]
         for x in sorted(infos, key=lambda x: (x["bbox"][1], x["bbox"][0])):
             rect = pymupdf.Rect(x["bbox"]) & page.rect
-            if rect.is_empty or min(rect.width, rect.height) < s.min_image_px * 72 / s.render_dpi:
+            if rect.is_empty:
+                continue
+            if min(rect.width, rect.height) < s.min_image_px * 72 / s.render_dpi:
+                tally["small"] += 1
                 continue
             if any(abs(rect & r) > 0.8 * abs(rect) for r in fig_rects):   # same picture twice
                 continue
+            t = raster_thumb(page, x, rect)
+            verdict = classify_picture(t, s, fmt="pdf", aspect=rect.width / max(rect.height, 1e-6),
+                                       cover=abs(rect) / area, words_on=words_on(rect))
+            if verdict != "figure":
+                reg.skip(n, verdict, t, f"page {n}")
+                tally[verdict] += 1
+                continue
             native_dpi = 72 * x.get("width", 0) / max(rect.width, 1)
-            dpi = min(int(max(s.render_dpi, min(native_dpi, 600))), _page_dpi_for_budget(page, s, rect) * 2)
-            ph = reg.add_blob(png_bytes(_render_clip(page, rect, max(72, dpi))), n, "png", f"page {n}")
+            dpi = _dpi_for_budget(rect, s, int(max(s.render_dpi, min(native_dpi, 600))))
+            ph = reg.add_blob(png_bytes(_render_clip(page, rect, dpi)), n, "png", f"page {n}")
             if ph:
                 figs.append(ph)
                 fig_rects.append(rect)
+                tally["sent"] += 1
         # vector charts / diagrams: clusters of drawings that are not tables
         if s.vector_figures:
             try:
                 tables = [pymupdf.Rect(t.bbox) for t in page.find_tables().tables]
+                drawings = None
                 for rect in page.cluster_drawings():
                     rect = pymupdf.Rect(rect) & page.rect
                     if abs(rect) < 0.04 * area or rect.height < 40:
@@ -1305,13 +1623,30 @@ def convert_pdf(path: Path, reg: ImageRegistry, s: Settings) -> Converted:
                         continue
                     if any(abs(rect & fr) > 0.5 * abs(rect) for fr in fig_rects):
                         continue
+                    if drawings is None:
+                        drawings = [pymupdf.Rect(d["rect"]) for d in page.get_drawings()]
+                    n_paths = sum(1 for d in drawings
+                                  if rect.contains(pymupdf.Point((d.x0 + d.x1) / 2, (d.y0 + d.y1) / 2)))
                     # include labels just outside the drawing (titles, axis ticks)
-                    rect = (rect + (-24, -24, 24, 24)) & page.rect
-                    ph = reg.add_image(_render_clip(page, rect, s.render_dpi), n, "figure",
-                                       f"page {n} (vector graphic)")
+                    grown = (rect + (-24, -24, 24, 24)) & page.rect
+                    t = None
+                    if n_paths < s.vector_min_paths:
+                        verdict = "decorative"          # a box, panel or rule, not a chart
+                    elif abs(rect) >= s.background_cover * area and words_on(rect) >= s.vector_background_words:
+                        verdict = "background"          # prose laid over a big graphic
+                    else:
+                        im = _render_clip(page, grown, s.render_dpi)
+                        t = make_thumb(im)
+                        verdict = classify_picture(t, s, fmt="vector", aspect=grown.width / grown.height)
+                    if verdict != "figure":
+                        reg.skip(n, verdict, t, f"page {n} (vector graphic)")
+                        tally[verdict] += 1
+                        continue
+                    ph = reg.add_image(im, n, "figure", f"page {n} (vector graphic)")
                     if ph:
                         figs.append(ph)
-                        fig_rects.append(rect)
+                        fig_rects.append(grown)
+                        tally["sent"] += 1
             except Exception as exc:  # noqa: BLE001
                 log.debug("vector figure detection failed on page %d: %s", n, exc)
 
@@ -1340,7 +1675,13 @@ def convert_pdf(path: Path, reg: ImageRegistry, s: Settings) -> Converted:
             text = text_doc[text_page].get_text()
         pages_md.append("\n\n".join(x for x in [text.strip(), *figs] if x))
 
-    meta: dict[str, Any] = {"format": "pdf"}
+        # one log line per page
+        sk = skipped_str(tally)
+        sent = f"{tally['sent']} figure(s) -> vision" if tally["sent"] else ""
+        imgs = "; ".join(x for x in (sk, sent) if x) or "no pictures"
+        log.info("page %d: text (%d chars) | images: %s", n, vis, imgs)
+
+    meta: dict[str, Any] = {"format": "pdf", "pages_text": pages_text, "pages_scanned": pages_scanned}
     title = (doc.metadata or {}).get("title") or ""
     if title.strip():
         meta["doc_title"] = title.strip()
@@ -1359,8 +1700,10 @@ def _image_frames(path: Path) -> list[Image.Image]:
 
 
 def convert_image(path: Path, reg: ImageRegistry, s: Settings) -> Converted:
-    frames = [reg.add_image(f, i + 1, "page", f"page {i + 1}") or "" for i, f in enumerate(_image_frames(path))]
-    return Converted(f"\n\n{PAGEBREAK_TAG}\n\n".join(frames), len(frames), {"format": "image"})
+    frames = [reg.add_image(f, i + 1, "page", f"page {i + 1}", scan=True) or ""
+              for i, f in enumerate(_image_frames(path))]
+    return Converted(f"\n\n{PAGEBREAK_TAG}\n\n".join(frames), len(frames),
+                     {"format": "image", "pages_text": 0, "pages_scanned": len(frames)})
 
 
 def adi_configured() -> bool:
@@ -1414,7 +1757,7 @@ def convert_with_adi(path: Path, reg: ImageRegistry, s: Settings, kind: str) -> 
                 import pymupdf
                 k = 72.0 if units.get(pn) == "inch" else 1.0
                 rect = pymupdf.Rect(min(xs) * k, min(ys) * k, max(xs) * k, max(ys) * k)
-                im = _render_clip(pdf[pn - 1], rect, _page_dpi_for_budget(pdf[pn - 1], s, rect))
+                im = _render_clip(pdf[pn - 1], rect, _dpi_for_budget(rect, s, s.render_dpi))
             else:
                 im = src_frames[pn].crop((int(min(xs)), int(min(ys)), int(max(xs)) + 1, int(max(ys)) + 1))
         except Exception as exc:  # noqa: BLE001
@@ -1424,6 +1767,11 @@ def convert_with_adi(path: Path, reg: ImageRegistry, s: Settings, kind: str) -> 
         end = fig.spans[-1].offset + fig.spans[-1].length
         ocr = clean_inline(re.sub(r"<figcaption.*?</figcaption>", "", content[start:end], flags=re.S))
         caption = fig.caption.content if getattr(fig, "caption", None) else ""
+        t = make_thumb(im)
+        verdict = classify_picture(t, s, fmt="adi")       # decorative check only
+        if verdict != "figure":                            # ADI's figure text stays in place
+            reg.skip(pn, verdict, t, f"page {pn}")
+            continue
         ph = reg.add_image(im, pn, "figure", f"page {pn}", ocr_text=ocr, caption=caption)
         if ph:
             edits.append((start, end, f"\n\n{ph}\n\n"))   # "**Figure:** caption" added by the pipeline
@@ -1457,6 +1805,10 @@ class ImageBatch(BaseModel):
 
 
 # Written in ASD-STE100 Simplified Technical English (same style as the extraction prompts).
+# Bump PROMPT_VERSION whenever a prompt (or the ImageResult schema) changes: it is part of
+# the vision cache key, so old cached results are not reused.
+PROMPT_VERSION = "2026-11-26.1"
+
 OVERVIEW_PROMPT = """\
 You change images from business documents into Markdown. Each image has a header line with its id, its kind and its position in the document.
 
@@ -1508,8 +1860,8 @@ def build_model(s: Settings):
     )
 
 
-def _image_block(im: Image.Image, s: Settings) -> dict[str, Any]:
-    return {"type": "image_url", "image_url": {"url": data_url(im), "detail": s.detail}}
+def _image_block(png: bytes, s: Settings) -> dict[str, Any]:
+    return {"type": "image_url", "image_url": {"url": data_url(png), "detail": s.detail}}
 
 
 def _batches(items: list[tuple[str, int]], max_items: int, max_patches: int) -> list[list[str]]:
@@ -1532,12 +1884,52 @@ class VisionStats:
     input_tokens: int = 0
     output_tokens: int = 0
     errors: int = 0
+    cache_hits: int = 0
 
     def add(self, raw: Any) -> None:
         self.calls += 1
         usage = getattr(raw, "usage_metadata", None) or {}
         self.input_tokens += int(usage.get("input_tokens") or 0)
         self.output_tokens += int(usage.get("output_tokens") or 0)
+
+
+class VisionCache:
+    """On-disk JSON cache of vision results, one file per key.
+
+    Key = sha256(image PNG bytes + model + detail + PROMPT_VERSION + pass + the other inputs
+    of the request: kind, OCR text, caption; for the zoom pass also the crops and the draft).
+    """
+
+    def __init__(self, s: Settings):
+        self.dir = Path(s.cache_dir).expanduser() if s.use_cache else None
+        self.s = s
+
+    def key(self, pass_name: str, *parts: bytes | str) -> str:
+        h = hashlib.sha256()
+        for p in (self.s.model, self.s.detail, PROMPT_VERSION, pass_name, *parts):
+            h.update(p if isinstance(p, bytes) else str(p).encode())
+            h.update(b"\x00")
+        return h.hexdigest()
+
+    def get(self, key: str) -> Optional[ImageResult]:
+        if self.dir is None:
+            return None
+        f = self.dir / f"{key}.json"
+        try:
+            return ImageResult.model_validate_json(f.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+
+    def put(self, key: str, r: ImageResult) -> None:
+        if self.dir is None:
+            return
+        try:
+            self.dir.mkdir(parents=True, exist_ok=True)
+            tmp = self.dir / f"{key}.{os.getpid()}.tmp"
+            tmp.write_text(r.model_dump_json(), encoding="utf-8")
+            tmp.replace(self.dir / f"{key}.json")
+        except OSError as exc:
+            log.debug("vision cache write failed: %s", exc)
 
 
 async def _run_batches(model, prompt: str, payloads: list[list[dict]], s: Settings,
@@ -1581,34 +1973,58 @@ async def transcribe_images(reg: ImageRegistry, s: Settings, model=None) -> tupl
     stats = VisionStats()
     if not reg.items:
         return {}, stats
-    model = model or build_model(s)
     items = reg.items
+    cache = VisionCache(s)
+    holder = {"model": model}
 
-    # ---------------- pass 1: overview (zoom out), all images, as few calls as possible
+    def get_model():
+        if holder["model"] is None:
+            if not os.getenv("OPENAI_API_KEY"):
+                raise ConversionError("OPENAI_API_KEY is not set (needed for pictures and scanned pages)")
+            holder["model"] = build_model(s)
+        return holder["model"]
+
+    def item_parts(it: ImageItem) -> tuple[str, str, str]:
+        return it.kind, it.ocr_text, it.caption
+
+    # ---------------- pass 1: overview (zoom out), all uncached images, as few calls as possible
     views = {i: overview_image(it, s) for i, it in items.items()}
-    sizes = [(i, patch_count(*views[i][0].size, s)) for i in items]
-    batches = _batches(sizes, s.max_images_per_call, s.max_patches_per_call)
-    payloads = []
-    for b in batches:
-        content: list[dict] = []
-        for i in b:
-            content.append({"type": "text", "text": _header(items[i])})
-            content.append(_image_block(views[i][0], s))
-        payloads.append(content)
-    prompt = OVERVIEW_PROMPT.format(max_zooms=s.max_zooms_per_image)
-    started = time.perf_counter()
-    results = await _run_batches(model, prompt, payloads, s, stats)
-    log.info("vision pass 1: %d image(s) in %d call(s), %.1fs", len(items), len(payloads),
-             time.perf_counter() - started)
-
+    pngs = {i: png_bytes(views[i][0]) for i in items}
     drafts: dict[str, ImageResult] = {}
-    for b, res in zip(batches, results):
-        got = {r.id: r for r in (res.images if res else [])}
-        for i in b:
-            if i in got:
-                drafts[i] = got[i]
+    keys = {i: cache.key("overview", pngs[i], *item_parts(it)) for i, it in items.items()}
+    todo = []
+    for i in items:
+        hit = cache.get(keys[i])
+        if hit is not None:
+            drafts[i] = hit.model_copy(update={"id": i})
+            stats.cache_hits += 1
+        else:
+            todo.append(i)
+    if todo:
+        sizes = [(i, patch_count(*views[i][0].size, s)) for i in todo]
+        batches = _batches(sizes, s.max_images_per_call, s.max_patches_per_call)
+        payloads = []
+        for b in batches:
+            content: list[dict] = []
+            for i in b:
+                content.append({"type": "text", "text": _header(items[i])})
+                content.append(_image_block(pngs[i], s))
+            payloads.append(content)
+        prompt = OVERVIEW_PROMPT.format(max_zooms=s.max_zooms_per_image)
+        started = time.perf_counter()
+        results = await _run_batches(get_model(), prompt, payloads, s, stats)
+        log.info("vision pass 1: %d image(s) in %d call(s), %.1fs (%d from cache)", len(todo),
+                 len(payloads), time.perf_counter() - started, len(items) - len(todo))
+        for b, res in zip(batches, results):
+            got = {r.id: r for r in (res.images if res else [])}
+            for i in b:
+                if i in got and got[i].markdown.strip():
+                    drafts[i] = got[i]
+                    cache.put(keys[i], got[i])
+    else:
+        log.info("vision pass 1: %d image(s), all from cache", len(items))
 
-    # ---------------- pass 2: zoom in where the model asked, detail was lost, or confidence is low
+    # ---------------- pass 2: zoom in only where the model flagged regions or confidence is low
     Box = tuple[float, float, float, float]
     for rnd in range(s.zoom_rounds):
         plan: dict[str, list[tuple[Box, str, Optional[float]]]] = {}
@@ -1617,47 +2033,63 @@ async def transcribe_images(reg: ImageRegistry, s: Settings, model=None) -> tupl
             regions: list[tuple[Box, str, Optional[float]]] = [
                 ((z.x_min, z.y_min, z.x_max, z.y_max), z.reason, None)
                 for z in (d.zoom_regions if d else [])][: s.max_zooms_per_image]
-            lost_detail = views[i][1] < 0.75                 # overview was downscaled a lot
-            low_conf = d is None or d.confidence < s.zoom_confidence
-            if not regions and (lost_detail or (low_conf and it.kind == "page")):
-                regions = [(b, "automatic tile", 0.0) for b in auto_tiles(it, s)]
-            elif not regions and low_conf:
-                regions = [((0, 0, 999, 999), "low confidence: full image at maximum magnification", 0.0)]
-            if regions:
-                plan[i] = regions
+            conf = d.confidence if d else 0.0
+            if not regions and conf >= s.zoom_confidence:
+                continue
+            if not regions:
+                if it.kind == "page" and views[i][1] < 0.75:     # whole page that lost detail
+                    regions = [(b, "automatic tile", 0.0) for b in auto_tiles(it, s)]
+                else:
+                    regions = [((0, 0, 999, 999), "low confidence: full image at maximum magnification", 0.0)]
+            plan[i] = regions
         if not plan:
             break
 
-        entries = []
+        entries, zkeys = [], {}
         for i, regions in plan.items():
-            crops = [(box, why, crop_region(items[i], box, s, pad)[0]) for box, why, pad in regions]
-            p = patch_count(*views[i][0].size, s) + sum(patch_count(*c.size, s) for _, _, c in crops)
-            entries.append((i, crops, p))
-        groups = _batches([(i, p) for i, _, p in entries], s.max_images_per_call, s.max_patches_per_call)
-        by_id = {i: crops for i, crops, _ in entries}
+            crops = []
+            for box, why, pad in regions:
+                im = crop_region(items[i], box, s, pad)[0]
+                crops.append((box, why, png_bytes(im), im.size))
+            draft = drafts[i].markdown if i in drafts else "(no draft: the first pass failed)"
+            zkeys[i] = cache.key("zoom", pngs[i], *[c[2] for c in crops], draft, *item_parts(items[i]))
+            hit = cache.get(zkeys[i])
+            if hit is not None:
+                hit = hit.model_copy(update={"id": i, "zoom_regions": []})
+                drafts[i] = hit
+                stats.cache_hits += 1
+                continue
+            p = patch_count(*views[i][0].size, s) + sum(patch_count(*c[3], s) for c in crops)
+            entries.append((i, crops, p, draft))
+        if not entries:
+            log.info("vision pass 2 (zoom round %d): %d image(s), all from cache", rnd + 1, len(plan))
+            continue
+        groups = _batches([(i, p) for i, _, p, _ in entries], s.max_images_per_call, s.max_patches_per_call)
+        by_id = {i: (crops, draft) for i, crops, _, draft in entries}
         payloads = []
         for g in groups:
             content = []
             for i in g:
+                crops, draft = by_id[i]
                 content.append({"type": "text", "text": _header(items[i]) + "\nFull image (zoom out):"})
-                content.append(_image_block(views[i][0], s))
-                for k, (box, why, crop) in enumerate(by_id[i], start=1):
+                content.append(_image_block(pngs[i], s))
+                for k, (box, why, crop_png, _) in enumerate(crops, start=1):
                     box_s = ", ".join(str(int(v)) for v in box)
                     content.append({"type": "text", "text": f"{i} zoom {k}: region [{box_s}] ({why})"})
-                    content.append(_image_block(crop, s))
-                draft = drafts[i].markdown if i in drafts else "(no draft: the first pass failed)"
+                    content.append(_image_block(crop_png, s))
                 content.append({"type": "text", "text": f"{i} draft Markdown:\n{draft}"})
             payloads.append(content)
         started = time.perf_counter()
-        results = await _run_batches(model, ZOOM_PROMPT, payloads, s, stats)
-        n_crops = sum(len(c) for c in by_id.values())
+        results = await _run_batches(get_model(), ZOOM_PROMPT, payloads, s, stats)
+        n_crops = sum(len(c) for c, _ in by_id.values())
         log.info("vision pass 2 (zoom round %d): %d image(s), %d crop(s), %d call(s), %.1fs",
-                 rnd + 1, len(plan), n_crops, len(payloads), time.perf_counter() - started)
+                 rnd + 1, len(by_id), n_crops, len(payloads), time.perf_counter() - started)
         for g, res in zip(groups, results):
             for r in (res.images if res else []):
-                if r.id in plan and r.markdown.strip():
+                if r.id in by_id and r.markdown.strip():
                     r.zoom_regions = []      # one round of corrections per pass
                     drafts[r.id] = r
+                    cache.put(zkeys[r.id], r)
 
     out = {}
     for i, it in items.items():
@@ -1727,6 +2159,7 @@ def convert_file(path: str | Path, s: Settings = Settings(), model=None) -> str:
             raise ConversionError(f"{path.name}: could not be read as {kind} "
                                   f"({type(exc).__name__}: {exc})") from exc
 
+        gone: list[str] = []
         if s.skip_repeated_images:
             gone = reg.drop_repeated(conv.units)
             if gone:
@@ -1739,15 +2172,20 @@ def convert_file(path: str | Path, s: Settings = Settings(), model=None) -> str:
         log.info("%s: %d unit(s), %d picture(s)/scan(s) for the vision model",
                  path.name, conv.units, len(reg.items))
         descriptions: dict[str, str] = {}
+        stats = VisionStats()
         if reg.items:
-            if model is None and not os.getenv("OPENAI_API_KEY"):
-                raise ConversionError("OPENAI_API_KEY is not set (needed for pictures and scanned pages)")
             descriptions, stats = _run_async(transcribe_images(reg, s, model))
-            log.info("vision: %d call(s), input=%d output=%d tokens, %d error(s)",
-                     stats.calls, stats.input_tokens, stats.output_tokens, stats.errors)
+            log.info("vision: %d call(s), %d cache hit(s), input=%d output=%d tokens, %d error(s)",
+                     stats.calls, stats.cache_hits, stats.input_tokens, stats.output_tokens, stats.errors)
 
         meta = dict(conv.meta)
         doc_title = meta.pop("doc_title", None)
+        meta.setdefault("pages_text", conv.units)
+        meta.setdefault("pages_scanned", 0)
+        meta["pictures_sent"] = sum(1 for it in reg.items.values() if not it.scan)
+        meta["pictures_skipped"] = len(reg.skipped) + len(gone)
+        meta["vision_calls"] = stats.calls
+        meta["vision_cache_hits"] = stats.cache_hits
         if reg.items:
             meta["vision_model"] = s.model
         md = normalize(body, source=path.name, page_rule=s.page_rule, keep_furniture=s.keep_furniture,
@@ -1771,6 +2209,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     p.add_argument("--reasoning-effort", default=d.reasoning_effort,
                    choices=["none", "minimal", "low", "medium", "high", "xhigh"])
     p.add_argument("--detail", default=d.detail, choices=["low", "high", "original", "auto"])
+    p.add_argument("--fast", action="store_true",
+                   help="one vision pass with low reasoning effort (zoom_rounds=0, reasoning_effort=low)")
+    p.add_argument("--no-cache", action="store_true", help="do not read or write the vision cache")
+    p.add_argument("--cache-dir", default=d.cache_dir, help=f"vision cache folder (default {d.cache_dir})")
     p.add_argument("--zoom-rounds", type=int, default=d.zoom_rounds, help="0 disables the zoom pass")
     p.add_argument("--max-images-per-call", type=int, default=d.max_images_per_call)
     p.add_argument("--use-adi", default=d.use_adi, choices=["auto", "always", "never"])
@@ -1789,11 +2231,13 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 def settings_from(a: argparse.Namespace) -> Settings:
     return replace(
-        Settings(), model=a.model, reasoning_effort=a.reasoning_effort, detail=a.detail,
-        zoom_rounds=a.zoom_rounds, max_images_per_call=a.max_images_per_call, use_adi=a.use_adi,
+        Settings(), model=a.model, detail=a.detail,
+        reasoning_effort="low" if a.fast else a.reasoning_effort,
+        zoom_rounds=0 if a.fast else a.zoom_rounds, max_images_per_call=a.max_images_per_call, use_adi=a.use_adi,
         pdf_mode=a.pdf_mode, render_dpi=a.render_dpi, skip_repeated_images=not a.keep_repeated_images,
         include_hidden=not a.skip_hidden, include_notes=not a.no_notes,
         max_sheet_rows=a.max_sheet_rows, page_rule=a.page_rule, keep_furniture=a.keep_furniture,
+        use_cache=not a.no_cache, cache_dir=a.cache_dir,
     )
 
 
@@ -1871,11 +2315,60 @@ class FakeVisionModel:
         return outs
 
 
-def _png(w=400, h=200, text="123.45") -> bytes:
+def _S(**kw) -> Settings:
+    """Test settings: never touch the user's vision cache."""
+    return Settings(use_cache=False, **kw)
+
+
+def _chart(w=400, h=200, text="123.45") -> Image.Image:
+    """A small bar chart: white background, coloured bars, axes, a label."""
     from PIL import ImageDraw
     im = Image.new("RGB", (w, h), "white")
-    ImageDraw.Draw(im).text((20, 20), text, fill="black")
-    return png_bytes(im)
+    d = ImageDraw.Draw(im)
+    for k in range(5):
+        x0, top = int(w * (0.12 + 0.16 * k)), int(h * (0.75 - 0.11 * k))
+        d.rectangle([x0, top, x0 + int(w * 0.1), int(h * 0.88)], fill=(40 + 40 * k, 90 + 20 * k, 200 - 30 * k))
+    lw = max(2, h // 80)
+    d.line([(int(w * .06), int(h * .88)), (int(w * .94), int(h * .88))], fill="black", width=lw)
+    d.line([(int(w * .06), int(h * .08)), (int(w * .06), int(h * .88))], fill="black", width=lw)
+    d.text((int(w * .1), int(h * .02)), text, fill="black")
+    return im
+
+
+def _png(w=400, h=200, text="123.45") -> bytes:
+    return png_bytes(_chart(w, h, text))
+
+
+def _photo(w=600, h=800, seed=1) -> Image.Image:
+    """Photo-like texture: many colours, sharp edges, no white."""
+    import random
+    from PIL import ImageDraw
+    rnd = random.Random(seed)
+    im = Image.new("RGB", (w, h), (90, 120, 150))
+    d = ImageDraw.Draw(im)
+    for _ in range(150):
+        x, y = rnd.randrange(w), rnd.randrange(h)
+        d.rectangle([x, y, x + rnd.randrange(20, w // 3), y + rnd.randrange(20, h // 3)],
+                    fill=(rnd.randrange(30, 200), rnd.randrange(30, 200), rnd.randrange(30, 200)))
+    return im
+
+
+def _gradient(w=400, h=300) -> Image.Image:
+    g = Image.linear_gradient("L").rotate(90).resize((w, h))
+    return Image.merge("RGB", (g, g.point(lambda v: 80 + v // 3), Image.new("L", (w, h), 200)))
+
+
+PROSE = ("Total assets increased to 4,512 million at year end, mainly because of higher "
+         "cash balances and new investments in the commercial lines business. ")
+
+
+def _text_lines(page, y0=72, lines=10, render_mode=0):
+    for k in range(lines):
+        page.insert_text((60, y0 + 14 * k), PROSE[:95], fontsize=9, render_mode=render_mode)
+
+
+def _image_count(req) -> int:
+    return sum(p["type"] == "image_url" for p in req)
 
 
 def test_normalizer_tables_checkboxes_pages():
@@ -1912,6 +2405,20 @@ def test_auto_tiles_cover_whole_image_and_are_capped():
     assert max(t[2] for t in tiles) == 999 and max(t[3] for t in tiles) == 999
 
 
+def test_picture_filter_rules():
+    s = Settings()
+    chart, photo = make_thumb(_chart()), make_thumb(_photo())
+    assert classify_picture(chart, s) == "figure" and classify_picture(photo, s) == "figure"
+    assert classify_picture(make_thumb(Image.new("RGB", (300, 300), (20, 60, 140))), s) == "decorative"
+    assert classify_picture(make_thumb(_gradient()), s) == "decorative"
+    assert classify_picture(make_thumb(_chart(1600, 60)), s) == "decorative"          # banner 26:1
+    assert classify_picture(photo, s, fmt="pdf", cover=0.9, words_on=40) == "background"
+    assert classify_picture(photo, s, fmt="pdf", cover=0.3, words_on=25) == "covered"
+    assert classify_picture(chart, s, fmt="pdf", cover=0.3, words_on=25) == "figure"   # chart labels
+    assert classify_picture(photo, s, fmt="pptx", cover=0.9, behind_text=True) == "background"
+    assert classify_picture(photo, s, fmt="pptx", cover=0.9, behind_text=False) == "figure"
+
+
 def test_docx_route(tmp_path):
     import docx
     d = docx.Document()
@@ -1926,10 +2433,11 @@ def test_docx_route(tmp_path):
     f = tmp_path / "a.docx"
     d.save(f)
     fake = FakeVisionModel()
-    md = convert_file(f, Settings(zoom_rounds=0), model=fake)
+    md = convert_file(f, _S(zoom_rounds=0), model=fake)
     assert "## Report" in md and "| Sales | 1,200 |" in md and "Transcribed IMG_1" in md
     assert 'title: "Annual report"' in md and "- **Smoker:** [x] Yes [ ] No" in md
     assert "**Figure:**" in md and len(fake.requests) == 1
+    assert "pictures_sent: 1" in md and "vision_calls: 1" in md
 
 
 def test_xlsx_route(tmp_path):
@@ -1944,7 +2452,7 @@ def test_xlsx_route(tmp_path):
     ws.merge_cells("A1:C1")
     f = tmp_path / "a.xlsx"
     wb.save(f)
-    md = convert_file(f, Settings(), model=FakeVisionModel())
+    md = convert_file(f, _S(), model=FakeVisionModel())
     assert "## Sheet: P&L" in md and "| Revenue | 1200.5 | 15.3% |" in md
     assert "**Income statement**" in md and "| Item | FY24 | Margin |" in md
 
@@ -1961,10 +2469,10 @@ def test_pptx_route_single_call_and_zoom(tmp_path):
     f = tmp_path / "a.pptx"
     prs.save(f)
     fake = FakeVisionModel(zoom_first=True, answer=lambda i, n: f"{i} pass{n}")
-    md = convert_file(f, Settings(), model=fake)
+    md = convert_file(f, _S(), model=fake)
     assert len(fake.requests) == 2                       # 1 overview call + 1 zoom call
-    assert sum(p["type"] == "image_url" for p in fake.requests[0]) == 2
-    assert sum(p["type"] == "image_url" for p in fake.requests[1]) == 4   # 2 full views + 2 crops
+    assert _image_count(fake.requests[0]) == 2
+    assert _image_count(fake.requests[1]) == 4           # 2 full views + 2 crops
     assert "IMG_1 pass2" in md and "## Slide 0" in md and "pages: 2" in md
 
 
@@ -1980,8 +2488,8 @@ def test_repeated_logo_dropped(tmp_path):
     f = tmp_path / "logo.pptx"
     prs.save(f)
     fake = FakeVisionModel()
-    md = convert_file(f, Settings(), model=fake)
-    assert not fake.requests and "<<IMG_" not in md
+    md = convert_file(f, _S(), model=fake)
+    assert not fake.requests and "<<IMG_" not in md and "pictures_skipped: 1" in md
 
 
 def test_pdf_scanned_and_text_pages(tmp_path):
@@ -1994,31 +2502,211 @@ def test_pdf_scanned_and_text_pages(tmp_path):
     f = tmp_path / "a.pdf"
     doc.save(f)
     fake = FakeVisionModel()
-    md = convert_file(f, Settings(zoom_rounds=0, use_adi="never"), model=fake)
+    md = convert_file(f, _S(zoom_rounds=0, use_adi="never"), model=fake)
     assert "Balance sheet text page" in md and "Transcribed IMG_1" in md and "<!-- page 2 -->" in md
+    assert "pages_text: 1" in md and "pages_scanned: 1" in md
+
+
+def test_pdf_text_on_full_page_background(tmp_path):
+    import pymupdf
+    doc = pymupdf.open()
+    p = doc.new_page()
+    p.insert_image(p.rect, stream=png_bytes(_photo()))
+    _text_lines(p)
+    f = tmp_path / "bg.pdf"
+    doc.save(f)
+    fake = FakeVisionModel()
+    md = convert_file(f, _S(use_adi="never"), model=fake)
+    assert not fake.requests and "Total assets increased" in md
+    assert "pages_text: 1" in md and "pictures_skipped: 1" in md and "vision_calls: 0" in md
+
+
+def test_pdf_text_with_pale_watermark(tmp_path):
+    import pymupdf
+    from PIL import ImageDraw, ImageFont
+    wm = Image.new("RGB", (600, 800), "white")
+    ImageDraw.Draw(wm).text((40, 350), "CONFIDENTIAL", fill=(228, 228, 228),
+                            font=ImageFont.load_default(size=80))
+    doc = pymupdf.open()
+    p = doc.new_page()
+    p.insert_image(pymupdf.Rect(60, 200, 540, 700), stream=png_bytes(wm))
+    _text_lines(p, y0=300)
+    f = tmp_path / "wm.pdf"
+    doc.save(f)
+    fake = FakeVisionModel()
+    md = convert_file(f, _S(use_adi="never"), model=fake)
+    assert not fake.requests and "Total assets increased" in md
+
+
+def test_pdf_searchable_scan_goes_whole_page(tmp_path):
+    import pymupdf
+    doc = pymupdf.open()
+    p = doc.new_page()
+    p.insert_image(p.rect, stream=png_bytes(_photo()))
+    _text_lines(p, render_mode=3)                       # invisible OCR layer
+    f = tmp_path / "ocr.pdf"
+    doc.save(f)
+    fake = FakeVisionModel()
+    md = convert_file(f, _S(use_adi="never"), model=fake)
+    assert len(fake.requests) == 1 and "kind: whole page" in fake.requests[0][0]["text"]
+    assert "pages_scanned: 1" in md
+
+
+def test_pdf_text_page_with_chart_image(tmp_path):
+    import pymupdf
+    doc = pymupdf.open()
+    p = doc.new_page()
+    _text_lines(p)
+    p.insert_image(pymupdf.Rect(72, 400, 500, 614), stream=_png(800, 400))
+    f = tmp_path / "chart.pdf"
+    doc.save(f)
+    fake = FakeVisionModel()
+    md = convert_file(f, _S(use_adi="never"), model=fake)
+    assert len(fake.requests) == 1 and "kind: picture" in fake.requests[0][0]["text"]
+    assert "Total assets increased" in md and "Transcribed IMG_1" in md
+
+
+def test_pdf_text_page_with_vector_chart(tmp_path):
+    import pymupdf
+    doc = pymupdf.open()
+    p = doc.new_page()
+    _text_lines(p)
+    for k in range(5):
+        x = 110 + 60 * k
+        p.draw_rect(pymupdf.Rect(x, 600 - 30 * (k + 1), x + 40, 600), color=None,
+                    fill=(0.2 + 0.15 * k, 0.4, 0.8 - 0.1 * k))
+        p.insert_text((x + 4, 614), f"LabelQ{k + 1}", fontsize=7)
+    p.draw_line((90, 600), (420, 600))
+    p.draw_line((90, 400), (90, 600))
+    f = tmp_path / "vec.pdf"
+    doc.save(f)
+    fake = FakeVisionModel()
+    md = convert_file(f, _S(use_adi="never"), model=fake)
+    assert len(fake.requests) == 1 and "vector graphic" in fake.requests[0][0]["text"]
+    assert "Total assets increased" in md and "LabelQ" not in md
+
+
+def _deck(tmp_path, name, build):
+    from pptx import Presentation
+    prs = Presentation()
+    build(prs, prs.slides.add_slide(prs.slide_layouts[6]))
+    f = tmp_path / name
+    prs.save(f)
+    return f
+
+
+def _pic(tmp_path, im: Image.Image, name: str) -> str:
+    p = tmp_path / name
+    im.save(p)
+    return str(p)
+
+
+def test_pptx_background_behind_text(tmp_path):
+    from pptx.util import Inches
+
+    def build(prs, sl):
+        sl.shapes.add_picture(_pic(tmp_path, _photo(800, 600), "bg.png"), 0, 0, prs.slide_width, prs.slide_height)
+        sl.shapes.add_textbox(Inches(1), Inches(1), Inches(8), Inches(2)).text_frame.text = "Quarterly revenue grew 12%"
+    fake = FakeVisionModel()
+    md = convert_file(_deck(tmp_path, "bg.pptx", build), _S(), model=fake)
+    assert not fake.requests and "Quarterly revenue grew 12%" in md and "pictures_skipped: 1" in md
+
+
+def test_pptx_text_and_chart_picture(tmp_path):
+    from pptx.util import Inches
+
+    def build(prs, sl):
+        sl.shapes.add_textbox(Inches(1), Inches(0.5), Inches(8), Inches(1)).text_frame.text = "Revenue summary"
+        sl.shapes.add_picture(_pic(tmp_path, _chart(), "c.png"), Inches(1), Inches(3), Inches(6))
+    fake = FakeVisionModel()
+    md = convert_file(_deck(tmp_path, "tc.pptx", build), _S(), model=fake)
+    assert len(fake.requests) == 1 and "kind: picture" in fake.requests[0][0]["text"]
+    assert md.index("Revenue summary") < md.index("Transcribed IMG_1")
+
+
+def test_pptx_picture_only_slide_is_whole_page(tmp_path):
+    def build(prs, sl):
+        sl.shapes.add_picture(_pic(tmp_path, _chart(1000, 750), "full.png"), 0, 0, prs.slide_width, prs.slide_height)
+    fake = FakeVisionModel()
+    md = convert_file(_deck(tmp_path, "full.pptx", build), _S(), model=fake)
+    assert len(fake.requests) == 1 and "kind: whole page" in fake.requests[0][0]["text"]
+    assert "Transcribed IMG_1" in md and "**Figure:**" not in md
+
+
+def test_pptx_banner_and_gradient_skipped(tmp_path):
+    from pptx.util import Inches
+
+    def build(prs, sl):
+        sl.shapes.add_textbox(Inches(1), Inches(3), Inches(8), Inches(1)).text_frame.text = "Agenda"
+        sl.shapes.add_picture(_pic(tmp_path, _chart(1600, 60), "line.png"), Inches(0.5), Inches(1), Inches(9))
+        sl.shapes.add_picture(_pic(tmp_path, _gradient(), "grad.png"), Inches(6), Inches(4), Inches(3))
+    fake = FakeVisionModel()
+    md = convert_file(_deck(tmp_path, "deco.pptx", build), _S(), model=fake)
+    assert not fake.requests and "Agenda" in md and "pictures_skipped: 2" in md
+
+
+def test_vision_cache_rerun_makes_no_calls(tmp_path):
+    from pptx.util import Inches
+
+    def build(prs, sl):
+        sl.shapes.add_textbox(Inches(1), Inches(0.5), Inches(8), Inches(1)).text_frame.text = "Results"
+        sl.shapes.add_picture(_pic(tmp_path, _chart(), "c.png"), Inches(1), Inches(3), Inches(6))
+    f = _deck(tmp_path, "cache.pptx", build)
+    s = Settings(cache_dir=str(tmp_path / "cache"))
+    first, second = FakeVisionModel(confidence=0.5), FakeVisionModel()
+    md1 = convert_file(f, s, model=first)
+    md2 = convert_file(f, s, model=second)
+    assert len(first.requests) == 2 and not second.requests      # overview + zoom, then nothing
+    assert md1.split("\n---\n", 1)[1] == md2.split("\n---\n", 1)[1]           # same body
+    assert "vision_calls: 0" in md2 and "vision_cache_hits: 2" in md2
+
+
+def test_fast_flag_one_call_for_three_figures(tmp_path):
+    from pptx import Presentation
+    from pptx.util import Inches
+    prs = Presentation()
+    for k in range(3):
+        sl = prs.slides.add_slide(prs.slide_layouts[5])
+        sl.shapes.title.text = f"Chart {k}"
+        sl.shapes.add_picture(_pic(tmp_path, _chart(text=f"series {k}"), f"c{k}.png"), Inches(1), Inches(2), Inches(5))
+    f = tmp_path / "fast.pptx"
+    prs.save(f)
+    s = settings_from(parse_args([str(f), "--fast", "--no-cache"]))
+    assert s.zoom_rounds == 0 and s.reasoning_effort == "low" and not s.use_cache
+    fake = FakeVisionModel(zoom_first=True, confidence=0.3)
+    md = convert_file(f, s, model=fake)
+    assert len(fake.requests) == 1 and _image_count(fake.requests[0]) == 3 and "pictures_sent: 3" in md
 
 
 def test_low_confidence_page_gets_tiles(tmp_path):
     f = tmp_path / "scan.png"
-    f.write_bytes(_png(2550, 3300, "scan"))
+    f.write_bytes(_png(5000, 6500, "scan"))
     fake = FakeVisionModel(confidence=0.5, answer=lambda i, n: f"{i} pass{n}")
-    md = convert_file(f, Settings(use_adi="never"), model=fake)
-    assert len(fake.requests) == 2 and sum(p["type"] == "image_url" for p in fake.requests[1]) >= 3
+    md = convert_file(f, _S(use_adi="never"), model=fake)
+    assert len(fake.requests) == 2 and _image_count(fake.requests[1]) >= 3
     assert "IMG_1 pass2" in md
+
+
+def test_high_confidence_figure_skips_zoom(tmp_path):
+    f = tmp_path / "big.png"
+    f.write_bytes(_png(5000, 6500, "scan"))
+    fake = FakeVisionModel(confidence=0.85)
+    convert_file(f, _S(use_adi="never"), model=fake)
+    assert len(fake.requests) == 1
 
 
 def test_adi_json_route(tmp_path):
     f = tmp_path / "result.json"
     f.write_text(json.dumps({"analyzeResult": {"contentFormat": "markdown", "content":
                  "# ACORD 125\n:selected: New :unselected: Renewal\n<!-- PageBreak -->\nPage 2"}}))
-    md = convert_file(f, Settings())
+    md = convert_file(f, _S())
     assert 'title: "ACORD 125"' in md and "- [x] New [ ] Renewal" in md and "pages: 2" in md
 
 
 def test_csv_route(tmp_path):
     f = tmp_path / "a.csv"
     f.write_text("name;amount\nA|B;1,5\n", encoding="utf-8")
-    md = convert_file(f, Settings())
+    md = convert_file(f, _S())
     assert "| name | amount |" in md and "| A\\|B | 1,5 |" in md
 
 
